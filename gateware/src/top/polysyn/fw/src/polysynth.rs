@@ -89,8 +89,35 @@ impl Polysynth0 {
         self.registers.midi_read().read().bits()
     }
 
-    pub fn usb_host_vbus(&mut self, enable: bool)  {
-        self.registers.usb_midi_host().write(|w| w.host().bit(enable) );
+    // `mode`: 0 = off, 1 = USB MIDI host, 2 = USB MIDI device.
+    // `attached`: Type-C controller sees a device (host mode, enables VBUS)
+    // or a host (device mode, connects to the bus).
+    pub fn set_usb_mode(&mut self, mode: u8, attached: bool)  {
+        self.registers.usb_mode().write(|w| unsafe {
+            w.mode().bits(mode);
+            w.vbus().bit(mode == 1 && attached);
+            w.connect().bit(mode == 2 && attached)
+        } );
+    }
+
+    /// Next complete UMP Stream message received by the USB MIDI device, if any.
+    pub fn ump_read(&mut self) -> Option<[u32; 4]> {
+        if self.registers.ump_status().read().rx_level().bits() < 4 {
+            return None;
+        }
+        Some(core::array::from_fn(|_| self.registers.ump_rx().read().bits()))
+    }
+
+    /// Send a 4-word UMP to the USB host. Dropped if there is no space.
+    pub fn ump_write(&mut self, msg: [u32; 4]) -> bool {
+        const UMP_FIFO_DEPTH: u8 = 16;
+        if self.registers.ump_status().read().tx_level().bits() > UMP_FIFO_DEPTH - 4 {
+            return false;
+        }
+        for word in msg {
+            self.registers.ump_tx().write(|w| unsafe { w.word().bits(word) } );
+        }
+        true
     }
 
     pub fn usb_host_midi(&mut self, cfg_id: u8, endpt_id: u8)  {

@@ -54,10 +54,11 @@ pub enum ProcMode {
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
 #[strum(serialize_all = "kebab-case")]
-pub enum UsbHost {
+pub enum UsbMode {
     #[default]
     Off,
-    On,
+    Host,
+    Device,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
@@ -178,7 +179,7 @@ pub struct MiscOpts {
     #[option]
     pub midi_ch: EnumOption<MidiChannel>,
     #[option]
-    pub usb_host: EnumOption<UsbHost>,
+    pub usb_mode: EnumOption<UsbMode>,
     #[option]
     pub serial_debug: EnumOption<UsbMidiSerialDebug>,
     #[option(false)]

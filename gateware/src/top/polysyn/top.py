@@ -21,8 +21,17 @@
                      └────┘
 
 Voices are controlled through touching jacks 0-5 or using a MIDI keyboard
-(TRS MIDI or USB host is supported). The control source must be selected in
-the menu system (MISC page).
+(TRS MIDI, USB host or USB device is supported). The USB role must be selected
+in the menu system (MISC page, `usb-mode`):
+
+    - `off`: TRS MIDI only.
+    - `host`: USB MIDI keyboards / controllers plugged into the USB port
+      (TRS MIDI is disabled).
+    - `device`: Tiliqua appears as a class-compliant USB MIDI 2.0 device
+      called 'Tiliqua polysyn' to a computer or tablet plugged into the USB
+      port (USB-MIDI 1.0 hosts are also supported). TRS MIDI also works.
+      MIDI 2.0 values are reduced to MIDI 1.0 resolution (7-bit CCs and
+      velocity, 14-bit pitch bend).
 
     - Voice mix is sent to output channels 2 and 3 (last 2 jacks).
 
@@ -44,7 +53,7 @@ the UI.
     .. code-block:: text
 
               USB MIDI   TRS MIDI
-                 ─────┐ ┌─────  (`usb-host` setting)
+                 ─────┐ ┌─────  (`usb-mode` setting)
                 ┌─────▼─▼─────┐
         touch──►│Voice Tracker├──►┌─────────┐
                 └─────────────┘   │ Voices  │
@@ -115,7 +124,7 @@ can also be used to control most of these through CCs as follows:
         MISC    touch-ctrl     -  enable/disable jacktouch input
         MISC    cc-highlight   -  highlight changed on CC input
         MISC    midi-ch        -  filter MIDI to specific channel (default: all)
-        MISC    usb-host       -  enable USB host MIDI (disables TRS)
+        MISC    usb-mode       -  USB MIDI off / host / device
         MISC    serial-debug   -  dump MIDI data out serial port
         MISC    save-opts      -  save all options to flash
         MISC    wipe-opts      -  reset all options to defaults
@@ -139,11 +148,14 @@ from amaranth_future import fixed
 
 from guh.engines.midi import USBMIDIHost
 
+
 from tiliqua import dsp, midi
 from tiliqua.build import sim
 from tiliqua.build.cli import top_level_cli
 from tiliqua.build.types import BitstreamHelp
 from tiliqua.dsp import ASQ
+from tiliqua.midi.usb_device import USBMIDI2Device
+from tiliqua.ulpi_mux import ULPIMux
 from tiliqua.raster import PSQ, scope
 from tiliqua.raster.plot import FramebufferPlotter
 from tiliqua.tiliqua_soc import TiliquaSoc
@@ -380,10 +392,14 @@ class SynthPeripheral(wiring.Component):
     class MidiRead(csr.Register, access="r"):
         msg: csr.Field(csr.action.R, unsigned(32))
 
-    class UsbMidiHost(csr.Register, access="w"):
-        """USB MIDI host settings."""
-        # 0 = off. 1 = enable VBUS and forward USB MIDI.
-        host:     csr.Field(csr.action.W, unsigned(1))
+    class UsbMode(csr.Register, access="w"):
+        """USB port role, and Type-C attach state (from the TUSB322)."""
+        # See `USB_MODE_*`.
+        mode:     csr.Field(csr.action.W, unsigned(2))
+        # Host mode: drive VBUS. Only set when a device is attached.
+        vbus:     csr.Field(csr.action.W, unsigned(1))
+        # Device mode: connect to the bus. Only set when a host is attached.
+        connect:  csr.Field(csr.action.W, unsigned(1))
 
     class UsbMidiCfg(csr.Register, access="w"):
         # Hardcoded MIDI streaming endpoint location (device specific)
@@ -392,6 +408,28 @@ class SynthPeripheral(wiring.Component):
     class MidiChannelFilter(csr.Register, access="w"):
         """Channel filter. 0 = no filter, 1..16 = single MIDI channel."""
         value: csr.Field(csr.action.W, unsigned(5))
+
+    class UmpRx(csr.Register, access="r"):
+        """Next word of a received UMP Stream message (pops on read)."""
+        word: csr.Field(csr.action.R, unsigned(32))
+
+    class UmpTx(csr.Register, access="w"):
+        """Push a word of a UMP to send to the USB host."""
+        word: csr.Field(csr.action.W, unsigned(32))
+
+    class UmpStatus(csr.Register, access="r"):
+        # Words waiting in the UMP Stream message receive FIFO.
+        rx_level: csr.Field(csr.action.R, unsigned(5))
+        # Words waiting in the UMP transmit FIFO.
+        tx_level: csr.Field(csr.action.R, unsigned(5))
+        # USB host selected the USB MIDI 2.0 (UMP) alternate setting.
+        ump_mode: csr.Field(csr.action.R, unsigned(1))
+
+    USB_MODE_OFF    = 0
+    USB_MODE_HOST   = 1
+    USB_MODE_DEVICE = 2
+
+    UMP_FIFO_DEPTH  = 16
 
     def __init__(self, synth=None):
         self.synth = synth
@@ -405,7 +443,7 @@ class SynthPeripheral(wiring.Component):
         self._matrix_busy   = regs.add("matrix_busy",   self.MatrixBusy(),    offset=voices_csr_end + 0x4)
         self._midi_write    = regs.add("midi_write",    self.MidiWrite(),     offset=voices_csr_end + 0x8)
         self._midi_read     = regs.add("midi_read",     self.MidiRead(),      offset=voices_csr_end + 0xC)
-        self._midi_host     = regs.add("usb_midi_host", self.UsbMidiHost(),   offset=voices_csr_end + 0x10)
+        self._usb_mode      = regs.add("usb_mode",      self.UsbMode(),       offset=voices_csr_end + 0x10)
         self._midi_cfg      = regs.add("usb_midi_cfg",  self.UsbMidiCfg(),    offset=voices_csr_end + 0x14)
         self._midi_endp     = regs.add("usb_midi_endp", self.UsbMidiCfg(),    offset=voices_csr_end + 0x18)
         self._attack_rate   = regs.add("attack_rate",   self.AttackRate(),    offset=voices_csr_end + 0x1C)
@@ -416,13 +454,22 @@ class SynthPeripheral(wiring.Component):
         self._wt_data       = regs.add("wt_data",       self.WavetableData(), offset=voices_csr_end + 0x30)
         self._lfo           = regs.add("lfo",           self.Lfo(),           offset=voices_csr_end + 0x34)
         self._midi_ch_filt  = regs.add("midi_ch_filter",self.MidiChannelFilter(), offset=voices_csr_end + 0x38)
+        self._ump_rx        = regs.add("ump_rx",        self.UmpRx(),         offset=voices_csr_end + 0x3C)
+        self._ump_tx        = regs.add("ump_tx",        self.UmpTx(),         offset=voices_csr_end + 0x40)
+        self._ump_status    = regs.add("ump_status",    self.UmpStatus(),     offset=voices_csr_end + 0x44)
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "bus": In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
             "i_midi": In(stream.Signature(midi.MidiMessage)),
-            "usb_midi_host": Out(1),
+            "usb_mode": Out(2),
+            "usb_vbus": Out(1),
+            "usb_connect": Out(1),
             "usb_midi_cfg_id": Out(4),
             "usb_midi_endpt_id": Out(4),
+            # UMP Stream messages from / to the USB MIDI device (for Endpoint Discovery)
+            "i_ump_stream": In(stream.Signature(unsigned(32))),
+            "o_ump": Out(stream.Signature(unsigned(32))),
+            "ump_mode": In(1),
         })
         self.bus.memory_map = self._bridge.bus.memory_map
 
@@ -461,8 +508,12 @@ class SynthPeripheral(wiring.Component):
         ]
 
         # USB MIDI flags
-        with m.If(self._midi_host.f.host.w_stb):
-            m.d.sync += self.usb_midi_host.eq(self._midi_host.f.host.w_data)
+        with m.If(self._usb_mode.element.w_stb):
+            m.d.sync += [
+                self.usb_mode.eq(self._usb_mode.f.mode.w_data),
+                self.usb_vbus.eq(self._usb_mode.f.vbus.w_data),
+                self.usb_connect.eq(self._usb_mode.f.connect.w_data),
+            ]
         with m.If(self._midi_cfg.f.value.w_stb):
             m.d.sync += self.usb_midi_cfg_id.eq(self._midi_cfg.f.value.w_data)
         with m.If(self._midi_endp.f.value.w_stb):
@@ -512,7 +563,7 @@ class SynthPeripheral(wiring.Component):
         # Pipe filtered MIDI -> SoC read FIFO so SoC can inspect external
         # MIDI traffic.
         m.submodules.read_midi_fifo = read_midi_fifo = SyncFIFOBuffered(
-            width=24, depth=8)
+            width=24, depth=16)
         m.d.comb += [
             read_midi_fifo.w_data.eq(midi_ch_filt.o.payload),
             read_midi_fifo.w_en.eq(midi_ch_filt.o.valid & midi_ch_filt.o.ready),
@@ -523,6 +574,42 @@ class SynthPeripheral(wiring.Component):
             m.d.comb += self._midi_read.f.msg.r_data.eq(read_midi_fifo.r_data)
         with m.Else():
             m.d.comb += self._midi_read.f.msg.r_data.eq(0)
+
+        # UMP Stream messages (always 4 words) from the USB MIDI device -> SoC.
+        # Whole messages are dropped if the SoC does not keep up.
+        m.submodules.ump_rx_fifo = ump_rx_fifo = SyncFIFOBuffered(
+            width=32, depth=self.UMP_FIFO_DEPTH)
+        rx_word_ix = Signal(2)
+        rx_keep = Signal()
+        rx_keep_now = Mux(rx_word_ix == 0,
+                          ump_rx_fifo.level <= self.UMP_FIFO_DEPTH - 4, rx_keep)
+        m.d.comb += [
+            self.i_ump_stream.ready.eq(1),
+            ump_rx_fifo.w_data.eq(self.i_ump_stream.payload),
+            ump_rx_fifo.w_en.eq(self.i_ump_stream.valid & rx_keep_now),
+            ump_rx_fifo.r_en.eq(self._ump_rx.element.r_stb),
+            self._ump_rx.f.word.r_data.eq(ump_rx_fifo.r_data),
+        ]
+        with m.If(self.i_ump_stream.valid):
+            m.d.sync += [
+                rx_word_ix.eq(rx_word_ix + 1),
+                rx_keep.eq(rx_keep_now),
+            ]
+
+        # UMPs from the SoC -> USB MIDI device (Endpoint Discovery replies).
+        m.submodules.ump_tx_fifo = ump_tx_fifo = SyncFIFOBuffered(
+            width=32, depth=self.UMP_FIFO_DEPTH)
+        m.d.comb += [
+            ump_tx_fifo.w_data.eq(self._ump_tx.f.word.w_data),
+            ump_tx_fifo.w_en.eq(self._ump_tx.element.w_stb),
+        ]
+        wiring.connect(m, ump_tx_fifo.r_stream, wiring.flipped(self.o_ump))
+
+        m.d.comb += [
+            self._ump_status.f.rx_level.r_data.eq(ump_rx_fifo.level),
+            self._ump_status.f.tx_level.r_data.eq(ump_tx_fifo.level),
+            self._ump_status.f.ump_mode.r_data.eq(self.ump_mode),
+        ]
 
 
         return m
@@ -536,7 +623,7 @@ class PolySoc(TiliquaSoc):
     bitstream_help = BitstreamHelp(
         brief="Touch+MIDI Polysynth (8-voice)",
         io_left=['phase cv / touch', 'filter cv / touch', 'drive cv / touch', 'touch', 'touch', 'clk / touch', 'out L', 'out R'],
-        io_right=['navigate menu', 'MIDI host', 'video out', '', '', 'TRS MIDI in']
+        io_right=['navigate menu', 'MIDI host/device', 'video out', '', '', 'TRS MIDI in']
     )
 
     def __init__(self, **kwargs):
@@ -602,32 +689,84 @@ class PolySoc(TiliquaSoc):
                 forward_rt=True)
             wiring.connect(m, serialrx.o, midi_decode_trs.i)
 
-            # USB MIDI host
+            # USB port (usb2): one PHY, shared between a USB MIDI host (MIDI
+            # keyboards / controllers) and a USB MIDI 2.0 device (iPad / computer).
+            SP = SynthPeripheral
             ulpi = platform.request(platform.default_usb_connection)
-            m.submodules.usb = usb = USBMIDIHost(
-                    bus=ulpi,
-            )
+            m.submodules.ulpi_mux = ulpi_mux = ULPIMux(ulpi, n_ports=2)
+            HOST_PORT, DEVICE_PORT = 0, 1
+            is_device = self.synth_periph.usb_mode == SP.USB_MODE_DEVICE
+            m.d.comb += ulpi_mux.select.eq(Mux(is_device, DEVICE_PORT, HOST_PORT))
+
+            # USB MIDI host
+            usb = USBMIDIHost(bus=ulpi_mux.ports[HOST_PORT])
+            m.submodules.usb = ResetInserter({"usb": ulpi_mux.core_reset[HOST_PORT]})(usb)
             m.submodules.midi_decode_usb = midi_decode_usb = midi.MidiDecodeUSB(
                 forward_rt=True)
             wiring.connect(m, usb.o_midi, midi_decode_usb.i)
 
-            # Only enable VBUS if MIDI HOST is enabled.
-            vbus_o = platform.request("usb_vbus_en").o
-            with m.If(self.synth_periph.usb_midi_host):
-                wiring.connect(m, midi_decode_usb.o, self.synth_periph.i_midi)
-                m.d.comb += vbus_o.eq(1)
-            with m.Else():
-                wiring.connect(m, midi_decode_trs.o, self.synth_periph.i_midi)
-                m.d.comb += vbus_o.eq(0)
+            # USB MIDI 2.0 device (UMP, or USB-MIDI 1.0 translated to UMP)
+            usb_dev = USBMIDI2Device(bus=ulpi_mux.ports[DEVICE_PORT], name="Tiliqua polysyn")
+            m.submodules.usb_dev = ResetInserter({"usb": ulpi_mux.core_reset[DEVICE_PORT]})(usb_dev)
+            m.d.comb += [
+                usb_dev.connect.eq(self.synth_periph.usb_connect),
+                self.synth_periph.ump_mode.eq(usb_dev.ump_mode),
+            ]
+            # UMP Stream messages (Endpoint Discovery) are handled by the SoC,
+            # everything else is translated to MIDI 1.0 for the synth.
+            m.submodules.ump_split = ump_split = midi.UMPStreamSplit()
+            m.submodules.midi_decode_ump = midi_decode_ump = midi.MidiDecodeUMP(
+                forward_rt=True)
+            m.submodules.midi2_to_midi1 = midi2_to_midi1 = midi.Midi2ToMidi1()
+            wiring.connect(m, usb_dev.o_ump, ump_split.i)
+            wiring.connect(m, ump_split.o_stream, self.synth_periph.i_ump_stream)
+            wiring.connect(m, self.synth_periph.o_ump, usb_dev.i_ump)
+            wiring.connect(m, ump_split.o, midi_decode_ump.i)
+            wiring.connect(m, midi_decode_ump.o, midi2_to_midi1.i)
 
-            # Route RT messages from the active MIDI source to clock divider.
-            # Drain the inactive source, connect the active one.
-            with m.If(self.synth_periph.usb_midi_host):
-                wiring.connect(m, midi_decode_usb.o_rt, clock_div.i)
-                m.d.comb += midi_decode_trs.o_rt.ready.eq(1)
-            with m.Else():
-                wiring.connect(m, midi_decode_trs.o_rt, clock_div.i)
-                m.d.comb += midi_decode_usb.o_rt.ready.eq(1)
+            # Device mode: TRS and USB device MIDI are merged.
+            m.submodules.midi_merge = midi_merge = dsp.stream_util.Arbiter(
+                n_channels=2, shape=midi.MidiMessage)
+            m.submodules.rt_merge = rt_merge = dsp.stream_util.Arbiter(
+                n_channels=2, shape=midi.Status.RT)
+
+            # Only enable VBUS if MIDI HOST is enabled (and a device is attached).
+            vbus_o = platform.request("usb_vbus_en").o
+            m.d.comb += vbus_o.eq((self.synth_periph.usb_mode == SP.USB_MODE_HOST) &
+                                  self.synth_periph.usb_vbus)
+
+            # Route MIDI (and RT messages, to the clock divider) from the active
+            # MIDI source(s). Drain the inactive sources.
+            with m.Switch(self.synth_periph.usb_mode):
+                with m.Case(SP.USB_MODE_HOST):
+                    wiring.connect(m, midi_decode_usb.o, self.synth_periph.i_midi)
+                    wiring.connect(m, midi_decode_usb.o_rt, clock_div.i)
+                    m.d.comb += [
+                        midi_decode_trs.o.ready.eq(1),
+                        midi_decode_trs.o_rt.ready.eq(1),
+                        midi2_to_midi1.o.ready.eq(1),
+                        midi_decode_ump.o_rt.ready.eq(1),
+                    ]
+                with m.Case(SP.USB_MODE_DEVICE):
+                    wiring.connect(m, midi_decode_trs.o, midi_merge.i[0])
+                    wiring.connect(m, midi2_to_midi1.o, midi_merge.i[1])
+                    wiring.connect(m, midi_merge.o, self.synth_periph.i_midi)
+                    wiring.connect(m, midi_decode_trs.o_rt, rt_merge.i[0])
+                    wiring.connect(m, midi_decode_ump.o_rt, rt_merge.i[1])
+                    wiring.connect(m, rt_merge.o, clock_div.i)
+                    m.d.comb += [
+                        midi_decode_usb.o.ready.eq(1),
+                        midi_decode_usb.o_rt.ready.eq(1),
+                    ]
+                with m.Default():
+                    wiring.connect(m, midi_decode_trs.o, self.synth_periph.i_midi)
+                    wiring.connect(m, midi_decode_trs.o_rt, clock_div.i)
+                    m.d.comb += [
+                        midi_decode_usb.o.ready.eq(1),
+                        midi_decode_usb.o_rt.ready.eq(1),
+                        midi2_to_midi1.o.ready.eq(1),
+                        midi_decode_ump.o_rt.ready.eq(1),
+                    ]
 
         # polysynth audio + jack detection
         wiring.connect(m, pmod0.o_cal, polysynth.i)

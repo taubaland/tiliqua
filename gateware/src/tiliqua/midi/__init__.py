@@ -8,5 +8,7 @@
 from .types import *
 from .decode_serial import *
 from .decode_usb import *
+from .decode_ump import *
+from .usb_ump import *
 from .voice_tracker import *
 from .misc import *

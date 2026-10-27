@@ -94,3 +94,84 @@ class MidiMessage(data.Struct):
             "msb": unsigned(8),
         }),
     })
+
+class Midi2Opcode(enum.Enum, shape=unsigned(4)):
+    """Status nibble of a MIDI 2.0 Channel Voice message (UMP message type 0x4)."""
+    REGISTERED_PER_NOTE_CONTROLLER = 0x0
+    ASSIGNABLE_PER_NOTE_CONTROLLER = 0x1
+    REGISTERED_CONTROLLER          = 0x2 # (RPN)
+    ASSIGNABLE_CONTROLLER          = 0x3 # (NRPN)
+    RELATIVE_REGISTERED_CONTROLLER = 0x4
+    RELATIVE_ASSIGNABLE_CONTROLLER = 0x5
+    PER_NOTE_PITCH_BEND            = 0x6
+    NOTE_OFF                       = 0x8
+    NOTE_ON                        = 0x9
+    POLY_PRESSURE                  = 0xA
+    CONTROL_CHANGE                 = 0xB
+    PROGRAM_CHANGE                 = 0xC
+    CHANNEL_PRESSURE               = 0xD
+    PITCH_BEND                     = 0xE
+    PER_NOTE_MANAGEMENT            = 0xF
+
+class Midi2Message(data.Struct):
+    """
+    Layout of a MIDI 2.0 Channel Voice message.
+
+    Bit-compatible with the 2 words of a UMP message type 0x4 (i.e.
+    ``Cat(word1, word0[0:28])``), excluding the message type nibble.
+    """
+
+    data: data.UnionLayout({
+        "raw": unsigned(32),
+        # NOTE_ON, NOTE_OFF
+        "note": data.StructLayout({
+            "attribute": unsigned(16),
+            "velocity": unsigned(16),
+        }),
+        # PROGRAM_CHANGE
+        "program": data.StructLayout({
+            "bank_lsb": unsigned(7),
+            "_reserved0": unsigned(1),
+            "bank_msb": unsigned(7),
+            "_reserved1": unsigned(9),
+            "program": unsigned(7),
+            "_reserved2": unsigned(1),
+        }),
+        # All other messages carry a single 32-bit value. Pitch bends are
+        # unsigned, centered at 0x80000000.
+    })
+    index: data.UnionLayout({
+        "raw": data.StructLayout({
+            "byte3": unsigned(8),
+            "byte2": unsigned(8),
+        }),
+        # NOTE_ON, NOTE_OFF
+        "note": data.StructLayout({
+            "attribute_type": unsigned(8),
+            "note": unsigned(8),
+        }),
+        # POLY_PRESSURE, PER_NOTE_PITCH_BEND, PER_NOTE_MANAGEMENT
+        # and per-note controllers.
+        "per_note": data.StructLayout({
+            "index": unsigned(8),
+            "note": unsigned(8),
+        }),
+        # CONTROL_CHANGE
+        "control": data.StructLayout({
+            "_reserved": unsigned(8),
+            "index": unsigned(8),
+        }),
+        # Registered / assignable controllers (RPN / NRPN)
+        "controller": data.StructLayout({
+            "index": unsigned(8),
+            "bank": unsigned(8),
+        }),
+        # PROGRAM_CHANGE
+        "program": data.StructLayout({
+            "bank_valid": unsigned(1),
+            "_reserved": unsigned(15),
+        }),
+    })
+    channel: unsigned(4)
+    opcode:  Midi2Opcode
+    group:   unsigned(4)

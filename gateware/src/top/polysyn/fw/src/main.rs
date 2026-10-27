@@ -20,6 +20,7 @@ use tiliqua_lib::*;
 use tiliqua_lib::draw;
 use tiliqua_lib::dsp::OnePoleSmoother;
 use tiliqua_lib::midi::MidiTouchController;
+use tiliqua_lib::ump::{UmpEndpoint, UmpEndpointConfig};
 use pac::constants::*;
 use tiliqua_hal::persist::Persist;
 use tiliqua_fw::*;
@@ -39,6 +40,18 @@ use static_cell::StaticCell;
 use tiliqua_fw::wavetable;
 
 pub const TIMER0_ISR_PERIOD_MS: u32 = 5;
+
+// Size of the MIDI read FIFO (gateware), which we drain every tick.
+const MIDI_READ_MAX_PER_TICK: usize = 16;
+
+const UMP_ENDPOINT: UmpEndpointConfig = UmpEndpointConfig {
+    name: "Tiliqua polysyn",
+    product_instance_id: "0000",
+    manufacturer_id: [0x7D, 0, 0], // non-commercial / development
+    family: 0,
+    model: 0,
+    version: [0, 0, 0, 1],
+};
 
 fn adsr_ui_to_rate(ui_value: u16) -> u16 {
     // 0..32768 -> 1ms..2000ms -> hardware rate
@@ -68,8 +81,11 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
         //
 
         let mut last_cc_index = None;
-        let midi_word = app.synth.midi_read();
-        if midi_word != 0 {
+        for _ in 0..MIDI_READ_MAX_PER_TICK {
+            let midi_word = app.synth.midi_read();
+            if midi_word == 0 {
+                break;
+            }
             // Blink MIDI activity LED on TRS port
             app.ui.midi_activity();
 
@@ -89,6 +105,32 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
             if opts.misc.serial_debug.value == UsbMidiSerialDebug::On {
                 info!("midi: 0x{:x} 0x{:x} 0x{:x}",
                       bytes[0], bytes[1], bytes[2]);
+            }
+        }
+
+        //
+        // Answer UMP Endpoint Discovery from a USB MIDI 2.0 host
+        // (in `usb-mode=device`), so it can show our name.
+        //
+
+        {
+            let App { synth, ump_endpoint, ump_replies, .. } = &mut *app;
+            while let Some(msg) = synth.ump_read() {
+                if opts.misc.serial_debug.value == UsbMidiSerialDebug::On {
+                    info!("ump rx: {:08x} {:08x} {:08x} {:08x}", msg[0], msg[1], msg[2], msg[3]);
+                }
+                ump_endpoint.process(msg, |reply| {
+                    if ump_replies.push_back(reply).is_err() {
+                        error!("ump: reply queue full, dropped reply");
+                    }
+                });
+            }
+            // Replies wait here if the host is slow to read them.
+            while let Some(reply) = ump_replies.front() {
+                if !synth.ump_write(*reply) {
+                    break;
+                }
+                ump_replies.pop_front();
             }
         }
 
@@ -247,6 +289,9 @@ struct App {
     cc_mapper: MidiCcMapper,
     // lfo phase accumulator
     lfo_phase: wavetable::Fix32,
+    // UMP endpoint (usb-mode=device)
+    ump_endpoint: UmpEndpoint,
+    ump_replies: heapless::Deque<[u32; 4], 16>,
 }
 
 impl App {
@@ -257,7 +302,7 @@ impl App {
         let touch_controller = MidiTouchController::new();
         let cc_mapper = build_cc_mapper(&ui.opts);
         synth.usb_host_midi(1, 1);
-        synth.usb_host_vbus(false); // default, but set anyway...
+        synth.set_usb_mode(UsbMode::Off as u8, false); // default, but set anyway...
         Self {
             ui,
             synth,
@@ -270,6 +315,8 @@ impl App {
             last_proc_amt: 0,
             cc_mapper,
             lfo_phase: wavetable::Fix32::ZERO,
+            ump_endpoint: UmpEndpoint::new(UMP_ENDPOINT),
+            ump_replies: heapless::Deque::new(),
         }
     }
 }
@@ -311,12 +358,13 @@ fn main() -> ! {
         &flash, bootinfo.manifest.get_option_storage_window(), &mut opts);
 
     //
-    // Configure TUSB322 (CC controller) in DFP/Host mode
-    // This is needed if Tiliqua is connected to a device with a true USB-C to USB-C cable.
-    // It is also used for detecting (and preventing) applying VBUS if we have a host/host
-    // connection.
+    // Configure TUSB322 (CC controller). Terminations are disabled until `usb-mode` is set:
+    // - host: DFP mode. This is needed if Tiliqua is connected to a device with a true
+    //   USB-C to USB-C cable. It is also used for detecting (and preventing) applying
+    //   VBUS if we have a host/host connection.
+    // - device: UFP mode, VBUS is never applied. We only connect to the bus once a host
+    //   is attached (fixes enumeration issues with some USB-C to USB-C connections).
     //
-    // TODO: disable terminations when host mode is disabled?
     // TODO: draw error text if this fails?
     //
 
@@ -351,7 +399,7 @@ fn main() -> ! {
         let v_active = display.size().height;
 
         let mut last_attached_state = AttachedState::NotAttached;
-        let mut last_opt_host_enabled = false;
+        let mut last_usb_mode = UsbMode::Off;
 
         loop {
 
@@ -365,34 +413,45 @@ fn main() -> ! {
                 let save_opts = app.ui.opts.misc.save_opts.poll();
                 let wipe_opts = app.ui.opts.misc.wipe_opts.poll();
 
-                // USB Host: Disable DFP terminations if `MISC->usb-host` option is off
+                // USB role from `MISC->usb-mode`. Disable terminations if it is off.
                 //
                 // This stops us supplying VCONN on the CC pins for e-tagged cables, fixing an
                 // edge case where we may backpower VBUS due to the following bug on
                 // early Tiliqua R5.1s: https://github.com/apfaudio/tiliqua-hardware/issues/1
                 //
 
-                let opt_host_enabled = app.ui.opts.misc.usb_host.value == UsbHost::On;
-                if last_opt_host_enabled != opt_host_enabled {
-                    if opt_host_enabled {
-                        tusb322.soft_reset().ok();
-                        tusb322.set_mode(TUSB322Mode::Dfp).ok();
-                    } else {
-                        tusb322.disable_term().ok();
-                        app.synth.usb_host_vbus(false);
+                let usb_mode = app.ui.opts.misc.usb_mode.value;
+                if last_usb_mode != usb_mode {
+                    // Always drop VBUS / disconnect before switching roles.
+                    app.synth.set_usb_mode(usb_mode as u8, false);
+                    match usb_mode {
+                        UsbMode::Host => {
+                            tusb322.soft_reset().ok();
+                            tusb322.set_mode(TUSB322Mode::Dfp).ok();
+                        }
+                        UsbMode::Device => {
+                            tusb322.soft_reset().ok();
+                            tusb322.set_mode(TUSB322Mode::Ufp).ok();
+                        }
+                        UsbMode::Off => {
+                            tusb322.disable_term().ok();
+                        }
                     }
+                    last_attached_state = AttachedState::NotAttached;
                 }
-                last_opt_host_enabled = opt_host_enabled;
+                last_usb_mode = usb_mode;
 
                 // Type-C hotplugging detection
                 //
-                // Only enable VBUS if the TUSB322 Type-C controller says we are attached as:
+                // Host: Only enable VBUS if the TUSB322 Type-C controller says we are attached as:
                 // - Attached.SRC
                 // - Attached.ACCESSORY && AccessoryType.DebugDfp
                 //
                 // Due to the same hardware bug as above, Tiliqua's host port in DFP mode may
                 // have the TUSB322I see some rare adapter combinations as `DebugDfp` accessories,
                 // rather than `Attached.SRC`. To work around this, we still power VBUS on `DebugDfp`.
+                //
+                // Device: Only connect to the bus if we are attached as Attached.SNK (host present).
                 //
 
                 if let Ok(ctrl) = tusb322.read_connection_status_control() {
@@ -407,7 +466,12 @@ fn main() -> ! {
                         let attached_debug_dfp =
                             (ctrl.attached_state == AttachedState::AttachedAccessory) &&
                             (conn.accessory == AccessoryType::DebugDfp);
-                        app.synth.usb_host_vbus(opt_host_enabled && (attached_src || attached_debug_dfp));
+                        let attached = match usb_mode {
+                            UsbMode::Host => attached_src || attached_debug_dfp,
+                            UsbMode::Device => ctrl.attached_state == AttachedState::AttachedSnk,
+                            UsbMode::Off => false,
+                        };
+                        app.synth.set_usb_mode(usb_mode as u8, attached);
                     }
                 }
 
