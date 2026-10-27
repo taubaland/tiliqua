@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Seb Holzapfel <me@sebholzapfel.com>
+# Copyright (c) 2026 Alex Toland <atoland89@gmail.com>
 #
 # SPDX-License-Identifier: CERN-OHL-S-2.0
 
