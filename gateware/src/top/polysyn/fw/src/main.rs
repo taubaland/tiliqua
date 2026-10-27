@@ -400,6 +400,7 @@ fn main() -> ! {
 
         let mut last_attached_state = AttachedState::NotAttached;
         let mut last_usb_mode = UsbMode::Off;
+        let mut log_usb_status = false;
 
         loop {
 
@@ -422,6 +423,7 @@ fn main() -> ! {
 
                 let usb_mode = app.ui.opts.misc.usb_mode.value;
                 if last_usb_mode != usb_mode {
+                    info!("usb-mode: {}", <&'static str>::from(usb_mode));
                     // Always drop VBUS / disconnect before switching roles.
                     app.synth.set_usb_mode(usb_mode as u8, false);
                     match usb_mode {
@@ -438,6 +440,7 @@ fn main() -> ! {
                         }
                     }
                     last_attached_state = AttachedState::NotAttached;
+                    log_usb_status = true;
                 }
                 last_usb_mode = usb_mode;
 
@@ -457,7 +460,8 @@ fn main() -> ! {
                 if let Ok(ctrl) = tusb322.read_connection_status_control() {
                     if let Ok(conn) = tusb322.read_connection_status() {
                         // Only update on valid reads to reduce risk of unintended toggling mid-stream
-                        if ctrl.attached_state != last_attached_state {
+                        if ctrl.attached_state != last_attached_state || log_usb_status {
+                            log_usb_status = false;
                             info!("USB CC hotplug: {ctrl:?} | {conn:?}");
                             last_attached_state = ctrl.attached_state;
                         }
